@@ -63,7 +63,7 @@ pip install pysbd py3langid
 
 
 
-### 2. 配置
+### 3. 配置
 
 编辑 `voices.yaml`，设置模型路径和预设音色：
 
@@ -79,7 +79,7 @@ voices:
     ref_text: "参考音频对应的文本"
 ```
 
-### 3. 启动服务
+### 4. 启动服务
 
 ```bash
 python tts_server.py

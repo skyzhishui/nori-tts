@@ -5,7 +5,7 @@ nori-tts 流式合成服务端
 提供 OpenAI 协议风格的 WS 流式合成端点，兼容 vLLM-Omni (TTS)。
 支持两种模式：
   1. CustomVoice 模式 - 使用本地配置的预设音色名称和参考音频
-  2. 声音克隆模式 - 客户端实时传入 ref_audio (base64) 和 ref_text
+  2. 声音克隆模式 - 客户端实时传入 ref_audio (data: URI base64) 和 ref_text
 
 协议流程（OpenAI 风格，兼容 vLLM-Omni TTS）：
   Client → Server:
@@ -34,8 +34,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import re
 import struct
 import time
+from contextlib import asynccontextmanager
 
 import numpy as np
 import yaml
@@ -69,9 +71,26 @@ logger = logging.getLogger("nori_tts")
 tts_engine: Optional[TTSEngine] = None
 voices_config: dict = {}  # 从 voices.yaml 加载的预设音色配置
 temp_dir = tempfile.mkdtemp(prefix="nori_tts_ref_")
+
+# 参考音频大小限制（防止超大 base64 payload 占满内存/磁盘）
+MAX_REF_AUDIO_BYTES = 20 * 1024 * 1024  # 解码后上限 20MB
+MAX_REF_AUDIO_B64_LEN = MAX_REF_AUDIO_BYTES * 4 // 3  # 对应 base64 文本长度上限
 ui_enabled: bool = False  # 是否启用 WebUI
 ui_tmp_dir: str = ""  # WebUI 合成音频保存目录
 voices_config_path: str = ""  # voices.yaml 路径（用于运行时写入）
+
+# ---------------------------------------------------------------------------
+# 应用生命周期（lifespan，替代已弃用的 on_event）
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时加载模型，关闭时清理临时目录"""
+    await startup_event()
+    yield
+    import shutil
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    logger.info("nori-tts 服务已关闭，临时目录已清理")
+
 
 app = FastAPI(
     title="nori-tts 流式合成服务",
@@ -84,6 +103,7 @@ app = FastAPI(
         "- **HTTP GET**: `/v1/audio/voices` — 预设音色列表\n"
     ),
     version="2.0",
+    lifespan=lifespan,
 )
 
 
@@ -185,7 +205,17 @@ def decode_base64_audio(ref_audio_b64: str) -> str:
     else:
         payload = ref_audio_b64
 
-    raw = base64.b64decode(payload)
+    if len(payload) > MAX_REF_AUDIO_B64_LEN:
+        raise ValueError(
+            f"参考音频过大: base64 长度 {len(payload)} 超过上限 {MAX_REF_AUDIO_B64_LEN}"
+            f"（约 {MAX_REF_AUDIO_BYTES // (1024 * 1024)}MB 原始数据）"
+        )
+    try:
+        raw = base64.b64decode(payload)
+    except Exception as e:
+        raise ValueError(f"参考音频 base64 解码失败: {e}")
+    if len(raw) > MAX_REF_AUDIO_BYTES:
+        raise ValueError(f"参考音频过大: {len(raw)} bytes 超过上限 {MAX_REF_AUDIO_BYTES} bytes")
     tmp_path = os.path.join(temp_dir, f"ref_{uuid.uuid4().hex}.wav")
     with open(tmp_path, "wb") as f:
         f.write(raw)
@@ -276,7 +306,8 @@ def _resolve_http_voice(request: SpeechRequest) -> tuple[str, str, str, str | No
             temp_ref_file = decode_base64_audio(request.ref_audio)
             ref_audio_path = temp_ref_file
         else:
-            ref_audio_path = request.ref_audio
+            # 安全限制：仅接受 data: URI（base64），拒绝本地路径/URL，防止任意文件读取
+            raise ValueError("克隆模式的 ref_audio 仅支持 data: URI（base64 编码）格式")
         ref_text = request.ref_text or ""
         spk_audio_path = ref_audio_path
         prompt_audio_path = ref_audio_path
@@ -473,10 +504,9 @@ class WSSession:
             if ref_audio_val.startswith("data:"):
                 self._temp_ref_file = decode_base64_audio(ref_audio_val)
                 self.ref_audio_path = self._temp_ref_file
-            elif ref_audio_val.startswith(("http://", "https://")):
-                raise ValueError("WS 克隆模式不支持 URL 格式的 ref_audio，请使用 base64")
             else:
-                self.ref_audio_path = ref_audio_val
+                # 安全限制：仅接受 data: URI（base64），拒绝本地路径/URL，防止任意文件读取
+                raise ValueError("克隆模式的 ref_audio 仅支持 data: URI（base64 编码）格式")
 
             self.ref_text = ref_text_val or ""
             logger.info(f"声音克隆模式: ref_audio={self.ref_audio_path}, ref_text={self.ref_text}")
@@ -935,18 +965,32 @@ async def ui_add_voice(request: UIAddVoiceRequest):
 
     voice_name = request.voice_name.strip()
 
+    # 安全校验：音色名只允许字母/数字/下划线/连字符/中日文，防止路径注入
+    if not re.fullmatch(r"[\w\u4e00-\u9fff-]+", voice_name):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "音色名称只能包含字母、数字、下划线、连字符或中日文字符"},
+        )
+
     # 检查是否已存在
     existing = voices_config.get("voices", {})
     if voice_name in existing:
         return JSONResponse(status_code=400, content={"error": f"音色 '{voice_name}' 已存在"})
 
     try:
-        # 解码 base64 音频
-        if request.ref_audio.startswith("data:"):
-            _, payload = request.ref_audio.split(",", 1)
-        else:
-            payload = request.ref_audio
-        raw = base64.b64decode(payload)
+        # 解码 base64 音频（统一走 decode_base64_audio，含大小限制与异常处理）
+        try:
+            tmp_decoded = decode_base64_audio(request.ref_audio)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+        try:
+            with open(tmp_decoded, "rb") as f:
+                raw = f.read()
+        finally:
+            try:
+                os.remove(tmp_decoded)
+            except OSError:
+                pass
 
         # 校验音频合法性
         import soundfile as sf
@@ -996,7 +1040,7 @@ async def ui_add_voice(request: UIAddVoiceRequest):
         # 预热新音色的参考音频缓存
         if tts_engine is not None:
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
                     lambda p=audio_path, t=request.ref_text.strip(): tts_engine.cache_prompt_audio(
@@ -1031,7 +1075,6 @@ async def ws_tts_stream(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
 async def startup_event():
     global tts_engine, TARGET_SAMPLE_RATE, MODEL_ID
     if tts_engine is not None:
@@ -1088,7 +1131,7 @@ async def startup_event():
     preset_voices = voices_config.get("voices", {})
     if preset_voices:
         logger.info(f"正在预热 {len(preset_voices)} 个预设音色的参考音频缓存...")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for voice_name, voice_cfg in preset_voices.items():
             ref_audio_path = voice_cfg.get("ref_audio_path")
             ref_text = voice_cfg.get("ref_text", "")

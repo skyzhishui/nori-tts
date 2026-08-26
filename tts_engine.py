@@ -177,11 +177,6 @@ def get_phones_and_bert(texts, tts_config: Config):
 # 模型加载
 # ===========================================================================
 
-import json
-import hashlib
-from io import BytesIO
-from safetensors.torch import load_model
-
 # 为兼容旧 checkpoint 中 `import utils` 的写法
 import sys as _sys
 _sys.modules['utils'] = gsv_utils
@@ -718,6 +713,7 @@ class TTSEngine:
         queue = asyncio.Queue()
 
         def _stream_wrapper():
+            exc = None
             try:
                 with self._infer_lock:
                     for audio_data, samplerate in self.infer_stream(
@@ -743,8 +739,15 @@ class TTSEngine:
                         sovits_model=sovits_model,
                     ):
                         loop.call_soon_threadsafe(queue.put_nowait, (audio_data, samplerate))
+            except Exception as e:
+                # 线程内异常不可静默丢失，传递给消费端
+                exc = e
+                logger.exception("infer_stream 线程执行异常")
             finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                if exc is not None:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("__error__", exc))
+                else:
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
 
         if executor is None:
             loop.run_in_executor(None, _stream_wrapper)
@@ -755,6 +758,10 @@ class TTSEngine:
             chunk = await queue.get()
             if chunk is None:
                 break
+            marker, exc = chunk[0], chunk[1]
+            if marker == "__error__":
+                raise RuntimeError(f"流式推理线程异常: {exc}") from exc
+            audio_data, samplerate = chunk
             yield chunk
 
     # ---- 内部辅助方法 ----

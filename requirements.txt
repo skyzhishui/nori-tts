@@ -48,3 +48,6 @@ pyyaml>=6.0
 
 # ---- 音频格式校验 ----
 soundfile>=0.12.0
+
+# ---- 音频编码（mp3/opus/flac 响应格式，需系统安装 ffmpeg）----
+pydub>=0.25.1
